@@ -559,7 +559,7 @@
             font-family: var(--font-primary);
         }
 
-        #invoice-overlay, #opening-overlay {
+        #invoice-overlay, #opening-overlay, #camera-overlay {
             position: fixed; inset: 0; background: rgba(1, 33, 38, 0.95);
             z-index: 80000; display: none; justify-content: center; align-items: center;
             flex-direction: column; padding: 20px; backdrop-filter: blur(35px);
@@ -624,6 +624,13 @@
     <h1 class="opening-text" style="color:var(--neon-blue); font-weight:900; text-align: center; font-size: 2.5rem; font-family: var(--font-primary);">Locker Unlocked</h1>
     <p id="deposit-instructions" style="color: var(--text-secondary); margin-top: 15px; font-size: 1.1rem; font-weight: 600; text-align: center; line-height: 1.5;">Please place the parcel inside.<br>System is monitoring weight.</p>
     <div id="weight-confirm-icon" style="display:none; font-size: 4rem; margin: 20px;">📦✅</div>
+</div>
+
+<div id="camera-overlay">
+    <h3 style="color:#39ff14; font-family:monospace; margin-bottom:20px; font-size: 1.8rem; text-align: center;">SCAN TFT MONITOR QR</h3>
+    <p style="color: var(--text-secondary); margin-bottom: 20px; text-align: center;">Align the locker's QR code inside the box to unlock.</p>
+    <div id="qr-reader" style="width:100%; max-width:350px; border:4px solid #39ff14; border-radius:15px; overflow:hidden; background:#000; min-height:300px;"></div>
+    <button class="btn btn-ghost" style="margin-top:30px; background: rgba(239, 68, 68, 0.2); border: 1px solid var(--danger-red); color: var(--danger-red);" onclick="stopCameraScanner()">Cancel Scan</button>
 </div>
 
 <div id="auth-overlay" style="position:fixed; inset:0; background:var(--bg-dark); z-index:100000; display:flex; justify-content:center; align-items:center; padding:20px;">
@@ -760,6 +767,11 @@
     let lastOccupiedState = { 1: false, 2: false };
     let selPayment = "Prepaid";
     let walletBal = null;
+    
+    let html5QrCode = null;
+    let currentRetrievingLocker = 0;
+    let expectedRetrievalToken = "";
+    let currentActiveTxnId = "";
 
     // --- UI HELPERS ---
     window.notify = (msg, type = "info") => {
@@ -856,22 +868,17 @@
                 const weightBadge = document.getElementById(`weight-l${num}`);
                 const overlay = document.getElementById('opening-overlay');
                 
-                // Update Weight Live
                 if (weightBadge) weightBadge.innerText = `${Math.round(locker.weight_status || 0)}g`;
 
                 if (card && statusLabel) {
-                    // State: AVAILABLE
                     if (locker.state === "AVAILABLE") {
                         card.className = "locker-card locker-available";
                         statusLabel.innerText = "AVAILABLE";
                         document.body.classList.remove("alarm-pulse");
                     }
-                    // State: DROPPING OFF (Door is open, waiting for weight and close)
                     else if (locker.state === "DEPOSIT_PROCESSING") {
                         card.className = "locker-card locker-warning";
                         statusLabel.innerText = "DETECTING PARCEL...";
-                        
-                        // Manage the loading overlay graphics
                         if (overlay && overlay.getAttribute('data-locker') == num) {
                             if ((locker.weight_status || 0) > 45) {
                                 document.getElementById('deposit-instructions').innerHTML = "Parcel weight verified.<br>Please close the door securely.";
@@ -882,28 +889,23 @@
                             }
                         }
                     }
-                    // State: BREACH (Weight removed before door closed)
                     else if (locker.state === "DEPOSIT_BREACH") {
                         card.className = "locker-card locker-breach";
                         statusLabel.innerText = "SECURITY BREACH!";
                         document.body.classList.add("alarm-pulse");
                     }
-                    // State: REJECTED (Recipient refused parcel)
                     else if (locker.state === "REJECTED_RETURN_PROCESSING") {
                         card.className = "locker-card locker-warning";
                         statusLabel.innerText = "REJECTED - AWAITING COURIER";
                     }
-                    // State: OCCUPIED (Successfully locked and loaded)
                     else if (locker.state === "OCCUPIED") {
                         card.className = "locker-card locker-occupied";
                         statusLabel.innerText = "SECURED";
                         document.body.classList.remove("alarm-pulse");
-                        
-                        // Auto-hide the loading screen if the ESP32 successfully secured the locker
                         if (overlay && overlay.getAttribute('data-locker') == num && overlay.style.display === 'flex') {
                             overlay.style.display = 'none';
                             notify("Parcel Secured Successfully.", "success");
-                            location.reload(); // Refresh the active transactions list
+                            location.reload(); 
                         }
                     }
                 }
@@ -999,7 +1001,6 @@
         } else {
             if (confirm("Are you sure you want to reject this parcel? This action will notify the courier to retrieve the item.")) {
                 update(ref(db, `parcels/${id}`), { status: "Rejected" });
-                // STRICT TRIGGER: Rejection State for ESP32
                 update(ref(db, `system_control/locker_${lockerId}`), { rejection_state: true }); 
                 notify("The parcel has been marked as rejected. The courier has been notified.", "error");
             }
@@ -1042,34 +1043,81 @@
 
     // --- PHASE 3: TRIGGER THE HANDSHAKE (QR ON TFT) ---
     window.triggerHandshake = async (id, lockerNum, tokenVal) => {
-        // STRICT TRIGGER: Tells ESP32 to send QR token to Mega via Serial
         await update(ref(db, `system_control/locker_${lockerNum}`), {
             ready_to_scan: true,
             active_token: tokenVal
         });
         
         notify("Hardware monitor activated. QR sent to TFT display.", "success");
-        
-        // Simulating the Web App Camera Scan for now (In a real mobile environment, this opens the camera).
-        // For prototyping, we will simulate a successful scan after 3 seconds.
-        setTimeout(() => {
-             if (confirm("Simulate Recipient Scanning the QR Code on the TFT Screen?")) {
-                 onScanSuccess(id, lockerNum);
-             }
-        }, 3000);
+        window.openCameraScanner(tokenVal, lockerNum, id);
     };
 
-    // --- PHASE 7: SUCCESSFUL SCAN TRIGGERS UNLOCK ---
-    async function onScanSuccess(parcelId, lockerNum) {
-        if ("vibrate" in navigator) navigator.vibrate([100, 50, 100, 50, 200]);
+    // --- PHASE 7: STRICT HARDWARE CAMERA SCANNER ---
+    window.openCameraScanner = (tokenToMatch, lockerNum, txnId) => {
+        currentRetrievingLocker = lockerNum;
+        expectedRetrievalToken = tokenToMatch;
+        currentActiveTxnId = txnId;
         
-        // STRICT TRIGGER: Validated QR triggers ESP32 Solenoid Retrieval Flow
-        await update(ref(db, `system_control/locker_${lockerNum}`), {
-             qr_validated: true 
-        });
+        const camOverlay = document.getElementById('camera-overlay');
+        camOverlay.style.display = 'flex';
 
-        await update(ref(db, `parcels/${parcelId}`), { status: "Completed" });
-        notify("Hardware connection validated. Solenoid unlocked.", "success");
+        if (!html5QrCode) {
+            html5QrCode = new Html5Qrcode("qr-reader");
+        }
+
+        html5QrCode.start(
+            { facingMode: "environment" }, 
+            { fps: 15, qrbox: { width: 250, height: 250 } },
+            onScanSuccess,
+            onScanFailure
+        ).catch((err) => {
+            window.stopCameraScanner();
+            notify("CAMERA BLOCKED: Ensure site is using HTTPS!", "error");
+            console.error("Camera Error:", err);
+        });
+    };
+
+    window.stopCameraScanner = () => {
+        if (html5QrCode && html5QrCode.isScanning) {
+            html5QrCode.stop().then(() => {
+                html5QrCode.clear();
+            }).catch(err => console.log(err));
+        }
+        const camOverlay = document.getElementById('camera-overlay');
+        if (camOverlay) camOverlay.style.display = 'none';
+    };
+
+    async function onScanSuccess(decodedText) {
+        if (decodedText === expectedRetrievalToken) {
+            window.stopCameraScanner();
+            
+            if ("vibrate" in navigator) navigator.vibrate([100, 50, 100, 50, 200]);
+
+            const authPulse = document.createElement('div');
+            authPulse.style = "position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(10, 15, 12, 0.98); z-index:99999; display:flex; align-items:center; justify-content:center; flex-direction:column; font-family:monospace;";
+            authPulse.innerHTML = `
+                <div style="font-size: 4rem; color: #39ff14; text-shadow: 0 0 40px rgba(57, 255, 20, 0.8); margin-bottom: 20px;">[ VALIDATED ]</div>
+                <div style="font-size: 1.2rem; color: #a0e8af; animation: pulseVeridian 1s infinite;">Executing Hardware Unlock...</div>
+            `;
+            document.body.appendChild(authPulse);
+            setTimeout(() => authPulse.remove(), 2500);
+            
+            await update(ref(db, `system_control/locker_${currentRetrievingLocker}`), {
+                 qr_validated: true 
+            });
+
+            await update(ref(db, `parcels/${currentActiveTxnId}`), {
+                status: "Completed"
+            });
+
+            notify("Solenoid Unlocked. Secure retrieval.", "success");
+        } else {
+            notify("Invalid QR Signature. Wrong Locker?", "error");
+        }
+    }
+
+    function onScanFailure(error) {
+        // Ignore routine scan failures
     }
 
     // --- COURIER ACTIONS (PHASE 1) ---
@@ -1090,7 +1138,6 @@
         }
     };
 
-    // STRICT PHOTO ENFORCEMENT
     window.proceedToGrid = () => {
         if(!document.getElementById("rec-name").value) return notify("Please provide the recipient's name.", "error");
         if(!document.getElementById("cour-name").value) return notify("Please input the courier details.", "error");
@@ -1109,7 +1156,6 @@
         document.getElementById("drop-step-2").style.display = "none";
     };
 
-    // PHASE 1: START HARDWARE ACTIVATION
     window.selectLocker = async (num) => {
         if (lastOccupiedState[num]) return notify(`Locker 0${num} is occupied!`, "error");
 
@@ -1125,7 +1171,6 @@
             const amt = parseFloat(document.getElementById('amount-due').value || 0).toFixed(2);
             const secureToken = Math.random().toString(36).substring(2, 12).toUpperCase();
 
-            // STRICT TRIGGER: Unlock Solenoid
             await update(ref(db, `system_control/locker_${num}`), {
                 lock_command: "UNLOCKED"
             });
@@ -1145,7 +1190,6 @@
                 timestamp: new Date().toLocaleString()
             });
 
-            // The loading screen will now be handled automatically by the "system_control" listener!
             document.getElementById('opening-overlay').setAttribute('data-locker', num);
             document.getElementById('opening-overlay').style.display = 'flex';
             toggleLoader(false);
