@@ -1,7 +1,7 @@
 /**
  * ============================================================
  * PROJECT: SLSU EExpress+ Smart Cloud Locker
- * VERSION: 10.2 (ESP32 Workflow Aligned & Cyber-Veridian UI)
+ * VERSION: 10.3 (Strict Hardware Camera Enforcement)
  * ============================================================
  */
 
@@ -36,7 +36,8 @@ let lastOccupiedState = { 1: false, 2: false };
 let selPayment = "Prepaid";
 let walletBal = 0.00;
 
-let html5QrcodeScanner = null;
+// Use direct hardware API variable instead of the UI Scanner
+let html5QrCode = null; 
 let currentRetrievingLocker = 0;
 let expectedRetrievalToken = "";
 let currentActiveTxnId = "";
@@ -471,39 +472,59 @@ window.triggerReadyToScan = async (lockerNum, txnId, token) => {
 };
 
 // ==========================================
-// 8. PHASE 7: RETRIEVAL SCANNER
+// 8. PHASE 7: RETRIEVAL SCANNER (NATIVE CAMERA ENFORCEMENT)
 // ==========================================
 window.openCameraScanner = (tokenToMatch, lockerNum, txnId) => {
     currentRetrievingLocker = lockerNum;
     expectedRetrievalToken = tokenToMatch;
     currentActiveTxnId = txnId;
     
-    const camOverlay = document.getElementById('camera-overlay');
+    let camOverlay = document.getElementById('camera-overlay');
     // Create the overlay dynamically if it doesn't exist in HTML
     if (!camOverlay) {
-        const div = document.createElement('div');
-        div.id = 'camera-overlay';
-        div.style = "position:fixed; inset:0; background:rgba(10, 15, 12, 0.98); z-index:90000; display:flex; flex-direction:column; justify-content:center; align-items:center; padding:20px;";
-        div.innerHTML = `<h3 style="color:#39ff14; font-family:monospace; margin-bottom:20px;">Scan TFT Monitor</h3><div id="qr-reader" style="width:100%; max-width:400px; border:4px solid #39ff14; border-radius:15px; overflow:hidden;"></div><button class="btn btn-ghost" style="margin-top:30px;" onclick="stopCameraScanner()">Cancel Scan</button>`;
-        document.body.appendChild(div);
+        camOverlay = document.createElement('div');
+        camOverlay.id = 'camera-overlay';
+        camOverlay.style = "position:fixed; inset:0; background:rgba(10, 15, 12, 0.98); z-index:90000; display:flex; flex-direction:column; justify-content:center; align-items:center; padding:20px;";
+        camOverlay.innerHTML = `
+            <h3 style="color:#39ff14; font-family:monospace; margin-bottom:20px;">Scan TFT Monitor</h3>
+            <div id="qr-reader" style="width:100%; max-width:400px; border:4px solid #39ff14; border-radius:15px; overflow:hidden; background:#000; min-height:300px;"></div>
+            <button class="btn btn-ghost" style="margin-top:30px; background: rgba(255,50,50,0.2); border: 1px solid #ff3333; color: #ff3333;" onclick="window.stopCameraScanner()">Cancel Scan</button>
+        `;
+        document.body.appendChild(camOverlay);
     } else {
         camOverlay.style.display = 'flex';
     }
 
-    if (html5QrcodeScanner) html5QrcodeScanner.clear();
-    html5QrcodeScanner = new Html5QrcodeScanner("qr-reader", { fps: 10, qrbox: 250 }, false);
-    html5QrcodeScanner.render(onScanSuccess, onScanFailure);
+    // DIRECT HARDWARE API: Bypasses the UI Simulator and forces the physical phone camera
+    if (!html5QrCode) {
+        html5QrCode = new Html5Qrcode("qr-reader");
+    }
+
+    html5QrCode.start(
+        { facingMode: "environment" }, // Forces rear camera
+        { fps: 15, qrbox: { width: 250, height: 250 } },
+        onScanSuccess,
+        onScanFailure
+    ).catch((err) => {
+        window.stopCameraScanner();
+        notify("CAMERA BLOCKED: Ensure site is using HTTPS!", "error");
+        console.error("Camera Error:", err);
+    });
 };
 
 window.stopCameraScanner = () => {
-    if (html5QrcodeScanner) html5QrcodeScanner.clear();
+    if (html5QrCode && html5QrCode.isScanning) {
+        html5QrCode.stop().then(() => {
+            html5QrCode.clear();
+        }).catch(err => console.log(err));
+    }
     const camOverlay = document.getElementById('camera-overlay');
     if (camOverlay) camOverlay.style.display = 'none';
 };
 
 async function onScanSuccess(decodedText) {
     if (decodedText === expectedRetrievalToken) {
-        stopCameraScanner();
+        window.stopCameraScanner();
         
         if ("vibrate" in navigator) navigator.vibrate([100, 50, 100, 50, 200]);
 
